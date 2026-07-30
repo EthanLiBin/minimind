@@ -382,12 +382,16 @@ if __name__ == "__main__":
     actor_model, tokenizer = init_model(lm_config, base_weight, device=args.device)
     ref_model, _ = init_model(lm_config, base_weight, device=args.device)
     ref_model = ref_model.eval().requires_grad_(False)
+    
+    # 从checkpoint中恢复
     moe_suffix = '_moe' if lm_config.use_moe else ''
     ckp = f'{args.save_dir}/{base_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
     state_dict = torch.load(ckp, map_location=args.device)
+    # 价值网络 V 模型，对每一个token进行期望评估(当前t -> T)
     critic_model = CriticModel(lm_config)
     critic_model.load_state_dict(state_dict, strict=False)
     critic_model = critic_model.to(args.device)
+    # 奖励模型
     reward_model = LMForRewardModel(args.reward_model_path, device=args.device, dtype=torch.float16)
     # Rollout引擎
     rollout_engine = create_rollout_engine(

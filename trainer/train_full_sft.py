@@ -81,6 +81,27 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         optimizer.zero_grad(set_to_none=True)
 
 
+"""
+    代码逻辑完全一样，区别全在参数和数据上——框架复用，只换了"食材"和"火候"。
+    
+    预训练 (pretrain):
+    from_weight='none'         → 随机初始化，从零开始
+    lr=5e-4                    → 学习率大，模型需要从头学一切
+    batch=32, accum=8          → 大数据量，大有效 batch
+    max_seq_len=340            → 预训练语料短，不需要太长
+    数据: PretrainDataset      → 海量无标注文本，纯 next-token 预测
+
+    全参微调 (full SFT):
+    from_weight='pretrain'     → 加载预训练权重，在底座上继续学
+    lr=1e-5                    → 学习率极小，只做"微调"不能破坏底座
+    batch=16, accum=1          → 微调数据少，小 batch 更稳
+    max_seq_len=768            → 对话数据可能更长
+    数据: SFTDataset           → 有标注的对话/指令数据
+    
+    pretrain: 让孩子学认字、学语法（海量文本，从零开始）→ 学 2 年，每天大量阅读
+    full_sft: 让孩子学会答题规范（指令数据，有模版）→ 在认字基础上，花 1 天学格式
+"""
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Full SFT")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
