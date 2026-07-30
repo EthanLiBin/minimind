@@ -38,6 +38,8 @@ def Logger(content):
 
 
 def get_lr(current_step, total_steps, lr):
+    # 把当前是第几步和总共需要多少步塞进余弦公式，算出这节课应该用多大学习率，每个 step 都重新算一次。
+    # math.cos(math.pi * current_step / total_steps) 核心是余弦函数
     return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
 
 
@@ -61,6 +63,20 @@ def setup_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
+    # 两种模式：传 model=None 就读，传了 model 就存。
+    """调用 lm_checkpoint(lm_config, model=model, ...)
+        │
+        ├─ model=模型 → 【保存】
+        │    1. 剥包装(lambda→DDP→compile)
+        │    2. 转 fp16 + CPU
+        │    3. 原子写入 .tmp → os.replace()
+        │    4. 存 model + optimizer + scaler + epoch/step + wandb_id
+        │    5. 清理内存
+        │
+        └─ model=None → 【加载】
+            1. 读 resume_path
+            2. 比较 GPU 数量，有变化就换算 step
+            3. 返回 ckp_data（None 表示没有 checkpoint）"""
     os.makedirs(save_dir, exist_ok=True)
     moe_path = '_moe' if lm_config.use_moe else ''
     ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
@@ -83,12 +99,12 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
                 wandb_id = getattr(wandb, 'id', None)
 
         resume_data = {
-            'model': state_dict,
-            'optimizer': optimizer.state_dict(),
-            'epoch': epoch,
-            'step': step,
-            'world_size': dist.get_world_size() if dist.is_initialized() else 1,
-            'wandb_id': wandb_id
+            'model': state_dict,    # 模型权重
+            'optimizer': optimizer.state_dict(),    # 优化器 momentum 等状态
+            'epoch': epoch,     # 当前 epoch（续训起点）
+            'step': step,       # 当前 step（续训起点）
+            'world_size': dist.get_world_size() if dist.is_initialized() else 1,    # 分布式信息
+            'wandb_id': wandb_id    # wandb 的 run id（续接图表）
         }
         for key, value in kwargs.items():
             if value is not None:
