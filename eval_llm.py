@@ -79,6 +79,7 @@ def main():
 
         print('🧠: ', end='')
         st = time.time()
+        # 自回归生成
         generated_ids = model.generate(
             inputs=inputs["input_ids"], attention_mask=inputs["attention_mask"],
             max_new_tokens=args.max_new_tokens, do_sample=True, streamer=streamer,

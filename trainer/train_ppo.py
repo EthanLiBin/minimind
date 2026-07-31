@@ -378,7 +378,7 @@ if __name__ == "__main__":
     
     # ========== 5. 初始化模型和数据 ==========
     base_weight = args.from_weight
-    # Actor模型
+    # Actor模型、Ref参考模型
     actor_model, tokenizer = init_model(lm_config, base_weight, device=args.device)
     ref_model, _ = init_model(lm_config, base_weight, device=args.device)
     ref_model = ref_model.eval().requires_grad_(False)
@@ -387,6 +387,7 @@ if __name__ == "__main__":
     moe_suffix = '_moe' if lm_config.use_moe else ''
     ckp = f'{args.save_dir}/{base_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
     state_dict = torch.load(ckp, map_location=args.device)
+
     # 价值网络 V 模型，对每一个token进行期望评估(当前t -> T)
     critic_model = CriticModel(lm_config)
     critic_model.load_state_dict(state_dict, strict=False)
@@ -394,6 +395,31 @@ if __name__ == "__main__":
     # 奖励模型
     reward_model = LMForRewardModel(args.reward_model_path, device=args.device, dtype=torch.float16)
     # Rollout引擎
+    # 之前的 pretrain 和 SFT 都是有标准答案的——模型看到上文，预测下一个词，和 labels 对比算 loss。
+    # 但 PPO 没有标准答案——模型要自己先说出"心里话"，然后靠奖励模型判断说得好不好。Rollout Engine 就是负责"让模型开口说话"的那个环节。
+    # PPO 让模型先说再做——先通过 rollout engine 生成回复，再用奖励信号教会模型说得更好。create_rollout_engine 就是创建这个"发言人"的工厂。
+    
+    # PPO 的一个 step:
+    # ┌─────────────────────────────────────────────────┐
+    # │  1. rollout_engine.rollout()                    │
+    # │     输入: prompt（"请解释量子力学"）              │
+    # │     输出: 模型生成的完整回复 + 每个token的log概率  │
+    # │     → "量子力学是研究微观粒子..."                  │
+    # └─────────────────────────────────────────────────┘
+    #                     ↓
+    # ┌─────────────────────────────────────────────────┐
+    # │  2. reward_model 打分                            │
+    # │     输入: prompt + 生成的回复                     │
+    # │     输出: 一个奖励分数（比如 4.2）                 │
+    # │     → 好回答分高，烂回答分低                       │
+    # └─────────────────────────────────────────────────┘
+    #                     ↓
+    # ┌─────────────────────────────────────────────────┐
+    # │  3. 算优势函数 + PPO 更新参数                     │
+    # │     ratio = 新logp / 旧logp                      │
+    # │     policy_loss = -advantage × clip(ratio)       │
+    # │     → 把高分回复的概率拉高，低分的概率压下去        │
+    # └─────────────────────────────────────────────────┘
     rollout_engine = create_rollout_engine(
         engine_type=args.rollout_engine,
         policy_model=actor_model,
@@ -404,17 +430,57 @@ if __name__ == "__main__":
         sglang_model_path=args.sglang_model_path,
         sglang_shared_path=args.sglang_shared_path,
     )
+    # 创建dataset
     train_ds = RLAIFDataset(args.data_path, tokenizer, max_length=(args.max_seq_len + args.max_gen_len), thinking_ratio=args.thinking_ratio)
+    # 分布式：DistributedSampler 负责分数据，DistributedDataParallel（DDP）负责同步梯度
+    # 每张卡虽然拿到的数据不同，但 gradient 通过 AllReduce 通信求平均后，每张卡得到的是完全一样的平均梯度。然后各自 optimizer.step() 更新的幅度一样，所以所有卡上的模型参数始终保持同步。
+    # DataParallel 是分数据、AllReduce 同步梯度；模型权重在每个进程上都有全量拷贝，更新后完全一致。
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
+
+    # 策略模型和 价值网络 模型的优化器
     actor_optimizer = optim.AdamW(actor_model.parameters(), lr=args.learning_rate)
     critic_optimizer = optim.AdamW(critic_model.parameters(), lr=args.critic_learning_rate)
+    
+    # PPO 的更新次数 = 数据batch × epoch × PPO重复次数 × mini_batch切割数 ÷ 梯度累积。调调度器就是告诉它总共要走多远，然后每步自动前进一步。
+    """1 个 epoch:
+        ├─ 250 个数据 batch
+        │   ├─ batch[0]:
+        │   │   rollout 一次 (采 32 条回复)
+        │   │   切割成 4 个 mini_batch (每份 8 条)
+        │   │   每份重复 PPO 更新 3 次
+        │   │   → optimizer.step() 执行了 4×3 = 12 次
+        │   │   → scheduler 前进了 12 步
+        │   │
+        │   ├─ batch[1]: 同上，scheduler 又前进 12 步
+        │   │ ...
+        │   └─ batch[249]: 同上
+        │
+        └─ epoch 结束时 scheduler 前进了 250×12 = 3000 步
+        2 个 epoch → 总共前进 6000 步
+    """
+    # 计算有多少个batch
     loader_for_count = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler)
     iters = len(loader_for_count)
+    # 算每个bacth会被切成几个mini_batch
+    # 为什么要切？PPO 更新时用小批量更稳定，但 rollout 时 batch 大一点效率高。
     mb_factor = max(1, math.ceil(args.batch_size / args.mini_batch_size))
+    """算优化器总共要更新几次
+        含义:
+        250 个数据batch
+        × 2 个 epoch
+        × 3 轮 PPO 更新（同一批数据反复用 3 次）
+        × 4 个 mini_batch（每个数据batch 拆成 4 份）
+        × 1 (没做梯度累积)
+        = 优化器总共更新 6000 次
+    """
     total_optimizer_steps = math.ceil(iters * args.epochs * args.ppo_update_iters * mb_factor / args.accumulation_steps)
+    
+    # 动态学习率 -> 余弦退火调度器
+    # 优化器如何调用？actor_scheduler.step()  -> lr 自动前进一步
     actor_scheduler = CosineAnnealingLR(actor_optimizer, T_max=total_optimizer_steps, eta_min=args.learning_rate / 10)
     critic_scheduler = CosineAnnealingLR(critic_optimizer, T_max=total_optimizer_steps, eta_min=args.critic_learning_rate / 10)
 
+    # 如果有checkpoint数据，加载checkpoint数据
     start_epoch, start_step = 0, 0
     if ckp_data:
         actor_model.load_state_dict(ckp_data['model'])
@@ -428,9 +494,13 @@ if __name__ == "__main__":
     
     # ========== 7. 编译和分布式包装 ==========
     if args.use_compile == 1:
+        # torch.compile 让你的 Python 代码跑得接近手写 CUDA 的速度，代价是第一次调用时停顿编译几十秒
+        # 先编译torch.compile，先把整个计算图看一遍，优化后再跑，省掉中间停顿和重复运算
         actor_model = torch.compile(actor_model)
         Logger('torch.compile enabled')
         rollout_engine.update_policy(actor_model)
+
+    # 检测是否做了分布式初始化
     if dist.is_initialized():
         actor_model = DistributedDataParallel(actor_model, device_ids=[local_rank])
         critic_model = DistributedDataParallel(critic_model, device_ids=[local_rank])

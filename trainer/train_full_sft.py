@@ -155,6 +155,9 @@ if __name__ == "__main__":
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    # 分布式：DistributedSampler 负责分数据，DistributedDataParallel（DDP）负责同步梯度
+    # 每张卡虽然拿到的数据不同，但 gradient 通过 AllReduce 通信求平均后，每张卡得到的是完全一样的平均梯度。然后各自 optimizer.step() 更新的幅度一样，所以所有卡上的模型参数始终保持同步。
+    # DataParallel 是分数据、AllReduce 同步梯度；模型权重在每个进程上都有全量拷贝，更新后完全一致。
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
