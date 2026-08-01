@@ -196,7 +196,7 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             # 把重要性权重裁到上限内（裁权重，不是裁目标）。
             per_token_loss = -(clamped_ratio * advantages.unsqueeze(1) * per_token_logps - args.beta * per_token_kl) # #  ← 裁剪"重要性权重"，梯度只走 log π
         else:
-            # loss = min( ratio·A,  clip(ratio, 1-ε, 1±ε)·A )
+            # loss = -min( ratio·A,  clip(ratio, 1-ε, 1±ε)·A )
             clipped_ratio = torch.clamp(ratio, 1 - args.epsilon, 1 + args.epsilon)
             per_token_loss1 = ratio * advantages.unsqueeze(1)
             per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
