@@ -175,11 +175,13 @@ class SkipBatchSampler(Sampler):
 
 class LMForRewardModel:
     def __init__(self, model_path, device="cuda", dtype=torch.float16):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        # 补充use_fast=False
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
         self.model = AutoModel.from_pretrained(model_path, torch_dtype=dtype, trust_remote_code=True)
         self.model = self.model.to(device).eval()
         self.device = device
 
+    # 加载奖励模型，并拿到输出response，最终拿到得分
     @torch.no_grad()
     def get_score(self, messages, response):
         history_text = "\n".join([f"{m['role']}: {m['content']}" for m in messages[:-1]])
