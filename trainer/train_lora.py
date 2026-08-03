@@ -21,7 +21,7 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 
 warnings.filterwarnings('ignore')
 
-
+# 做模型微调处理
 def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
     start_time = time.time()
     last_step = start_step
@@ -29,24 +29,33 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
         last_step = step
+        # 动态学习率，余弦退火学习率调度
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
+        # autocast_ctx -> 使用混合精度来进行计算
         with autocast_ctx:
             res = model(input_ids, labels=labels)
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
+        # fp16 梯度太小会下溢变 0。scaler.scale 先给 loss 乘一个大数（比如 65536），再反向传播
         scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0:
+            # scaler.unscale_ -> 把刚才放大的梯度除回去，恢复到正确的大小
             scaler.unscale_(optimizer)
+            # 梯度裁剪。限制梯度的大小，不要让它爆炸，总长度限制在 grad_clip
             torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
+            # optimizer.step()  # 每个参数 = 参数 - lr × 梯度
             scaler.step(optimizer)
+            # 更新 scaler 内部的缩放因子
+            # 缩放因子在动态调整：没有溢出就慢慢放大，出错了就立刻缩小。
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
+        # 间隔log_interval轮做一次统计
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
@@ -56,7 +65,15 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
-
+        
+        """每 save_interval 步:
+            ┌─ 只在 rank=0 的卡上执行
+            ├─ eval()  ← 临时关 dropout
+            ├─ 穿透 DDP + compile 包装
+            ├─ 存权重 (.half().cpu())  → 推理用
+            ├─ 存完整 checkpoint       → 断点续训用
+            ├─ train() ← 恢复训练模式
+            └─ del 释放内存"""
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
@@ -69,9 +86,12 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
         del input_ids, labels, res, loss
 
     if last_step > start_step and last_step % args.accumulation_steps != 0:
+        # scaler.unscale_ -> 把刚才放大的梯度除回去，恢复到正确的大小
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
         scaler.step(optimizer)
+        # 更新 scaler 内部的缩放因子
+        # 缩放因子在动态调整：没有溢出就慢慢放大，出错了就立刻缩小。
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
@@ -119,7 +139,7 @@ if __name__ == "__main__":
     # ========== 4. 配wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
-        import swanlab as wandb
+        import wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-LoRA-{args.lora_name}-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LR-{args.learning_rate}"
